@@ -13,7 +13,17 @@ from typing import Callable, Optional
 import github_tools
 import state_store
 from evaluator import score_case
-from models import AgentState, BatchResult, CaseResult, IssueCase, MemoryChange
+from metrics import improvement_from_baseline, improvement_from_previous_cycle
+from models import (
+    AgentState,
+    BatchResult,
+    CaseResult,
+    ExperimentResult,
+    IssueCase,
+    MemoryChange,
+    RoundMetrics,
+    utcnow_iso,
+)
 from reflector import apply_reflection, build_initial_state, reflect
 from runner import run_worker_agent
 
@@ -21,15 +31,22 @@ DEFAULT_LABEL_POOL_SIZE = 6  # how many of the repo's real labels to focus the d
 
 
 def prepare_dataset(owner: str, repo: str, token: str | None,
-                     num_batches: int, batch_size: int) -> tuple[list[dict], list[IssueCase]]:
+                    num_batches: int, batch_size: int,
+                    eval_size: int = 0) -> tuple[list[dict], list[IssueCase]]:
     """Fetch real repo labels + a real historical, labeled, time-ordered
-    dataset sized to exactly fill num_batches * batch_size."""
+    dataset sized to exactly fill num_batches * batch_size training issues
+    plus eval_size held-out eval issues.
+
+    The search returns issues oldest-first, so the LAST eval_size issues are
+    the NEWEST - evaluating them repeatedly across cycles measures
+    generalization to unseen issues, not memorization. eval_size defaults to
+    0 so the normal learning session's behavior is unchanged."""
     all_labels = github_tools.fetch_repo_labels(owner, repo, token)
     # Focus on the most commonly-used labels so the label space stays tractable
     # for a demo - a real production version would use all of them.
     label_pool = [l["name"] for l in all_labels[:DEFAULT_LABEL_POOL_SIZE]]
 
-    total_needed = num_batches * batch_size
+    total_needed = num_batches * batch_size + eval_size
     raw = github_tools.build_historical_dataset(
         owner, repo, label_pool, token=token,
         per_label=max(10, total_needed // max(1, len(label_pool)) + 4),
@@ -114,3 +131,141 @@ def run_learning_session(
             on_step(result, state, change)
 
     return state, history
+
+
+def _round_metrics(round_type: str, cycle: int, result: BatchResult) -> RoundMetrics:
+    """Convert one runtime BatchResult into its comparable RoundMetrics form."""
+    return RoundMetrics(
+        round_type=round_type,
+        cycle=cycle,
+        issue_numbers=[c.issue_number for c in result.cases],
+        accuracy=result.accuracy,
+        tool_calls=sum(len(c.tool_calls) for c in result.cases),
+        tool_errors=result.tool_error_count,
+        average_latency_s=result.avg_latency_s,
+        estimated_cost_usd=round(result.avg_cost_usd * len(result.cases), 6),
+        memory_size=result.memory_size_before,
+    )
+
+
+def run_learning_experiment(
+    owner: str, repo: str, token: Optional[str],
+    train_batch_size: int = 6, num_cycles: int = 2, eval_size: int = 6,
+    on_round: Optional[Callable[[RoundMetrics, AgentState, MemoryChange], None]] = None,
+) -> tuple[AgentState, ExperimentResult]:
+    """
+    Runs the MEASURED learning protocol - the one that can actually prove
+    "the agent gets better at the task":
+
+      1. baseline_eval: score the held-out eval set with the fresh agent
+         (empty memory). This is the baseline every improvement is measured
+         against.
+      2. per cycle: train on one time-ordered batch, reflect ONLY on that
+         batch's failures, apply the reflection (memory grows here), then
+         re-score the SAME held-out eval set.
+
+    The eval set is fixed and newest-first (prepare_dataset is time-ordered
+    oldest-first), so every cycle accuracy is measured on identical issues we
+    never trained on. Eval runs are pure measurement: their results are never
+    passed to reflect(), so the agent can never learn from the eval set.
+
+    on_round(round_metrics, state_after, memory_change) is called after each
+    round with an empty MemoryChange for eval/baseline rounds (no learning
+    happened). The final ExperimentResult is persisted alongside the agent
+    state to data/agents/<owner>_<repo>/experiment.json.
+    """
+    labels, cases = prepare_dataset(
+        owner, repo, token, num_cycles, train_batch_size, eval_size=eval_size,
+    )
+
+    train_end = num_cycles * train_batch_size
+    train_cases = cases[:train_end]
+    eval_cases = cases[train_end:train_end + eval_size]
+
+    if len(train_cases) < train_end:
+        raise ValueError(
+            f"Need {train_end} training issues ({num_cycles} cycles x "
+            f"{train_batch_size}/cycle) but only {len(train_cases)} were fetched. "
+            "Increase the dataset size or lower --cycles/--train-batch-size."
+        )
+    if len(eval_cases) < eval_size:
+        raise ValueError(
+            f"Need {eval_size} held-out eval issues but only {len(eval_cases)} "
+            f"remain after reserving {train_end} for training. Increase the "
+            "dataset size or lower --eval-size."
+        )
+
+    # An experiment always starts from a fresh agent: a memory-free baseline
+    # is what the improvements are measured against.
+    state = build_initial_state(owner, repo, labels)
+    state_store.save_state(state)
+
+    rounds: list[RoundMetrics] = []
+    memory_added = memory_merged = memory_revised = memory_rejected = 0
+
+    # Baseline: score the held-out eval set BEFORE any learning.
+    baseline_result = run_time_step(state, eval_cases, owner, repo, token, labels)
+    baseline = _round_metrics("baseline_eval", 0, baseline_result)
+    rounds.append(baseline)
+    if on_round:
+        on_round(baseline, state, MemoryChange())
+
+    cycle_accuracies: list[float] = []
+    train_issue_numbers: list[int] = []
+
+    for cycle in range(1, num_cycles + 1):
+        train_batch = train_cases[(cycle - 1) * train_batch_size: cycle * train_batch_size]
+        train_issue_numbers.extend(issue.number for issue in train_batch)
+
+        # --- learn from THIS train batch ---
+        train_result = run_time_step(state, train_batch, owner, repo, token, labels)
+        train_metrics = _round_metrics("train_cycle", cycle, train_result)
+        rounds.append(train_metrics)
+
+        reflection = reflect(state, train_result)
+        state, change = apply_reflection(state, reflection)
+        memory_added += len(change.created)
+        memory_merged += len(change.merged)
+        memory_revised += len(change.revised)
+        memory_rejected += len(change.rejected)
+        state_store.save_state(state)
+
+        if on_round:
+            on_round(train_metrics, state, change)
+
+        # --- measure on the SAME held-out eval set (never reflected on) ---
+        eval_result = run_time_step(state, eval_cases, owner, repo, token, labels)
+        eval_metrics = _round_metrics("cycle_eval", cycle, eval_result)
+        rounds.append(eval_metrics)
+        cycle_accuracies.append(eval_metrics.accuracy)
+
+        if on_round:
+            on_round(eval_metrics, state, MemoryChange())
+
+    total_cases = sum(len(r.issue_numbers) for r in rounds)
+    total_latency = sum(r.average_latency_s * len(r.issue_numbers) for r in rounds)
+
+    experiment = ExperimentResult(
+        owner=owner,
+        repo=repo,
+        created_at=utcnow_iso(),
+        num_cycles=num_cycles,
+        baseline_accuracy=round(baseline.accuracy, 4),
+        cycle_accuracy=[round(a, 4) for a in cycle_accuracies],
+        improvement_from_baseline=improvement_from_baseline(cycle_accuracies, baseline.accuracy),
+        improvement_from_previous_cycle=improvement_from_previous_cycle(cycle_accuracies, baseline.accuracy),
+        memory_added=memory_added,
+        memory_merged=memory_merged,
+        memory_revised=memory_revised,
+        memory_rejected=memory_rejected,
+        tool_calls=sum(r.tool_calls for r in rounds),
+        tool_errors=sum(r.tool_errors for r in rounds),
+        average_latency=round(total_latency / total_cases, 4) if total_cases else 0.0,
+        estimated_cost=round(sum(r.estimated_cost_usd for r in rounds), 6),
+        train_issue_numbers=train_issue_numbers,
+        eval_issue_numbers=[issue.number for issue in eval_cases],
+        rounds=rounds,
+    )
+    state_store.save_experiment_result(owner, repo, experiment)
+
+    return state, experiment
