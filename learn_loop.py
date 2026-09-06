@@ -49,7 +49,13 @@ def prepare_dataset(owner: str, repo: str, token: str | None,
     total_needed = num_batches * batch_size + eval_size
     raw = github_tools.build_historical_dataset(
         owner, repo, label_pool, token=token,
-        per_label=max(10, total_needed // max(1, len(label_pool)) + 4),
+        # The +6 slack exists because build_historical_dataset dedupes
+        # candidates ACROSS labels (flask's old issues carry several pool
+        # labels), so a fetch sized to exactly total_needed/len(pool) per
+        # label comes up short: a 36-issue request got 35 unique issues at
+        # +4 slack. +6 yields ~40-51 unique for the same request shape while
+        # leaving every smaller run unchanged (max(10, ...) still dominates).
+        per_label=max(10, total_needed // max(1, len(label_pool)) + 6),
         total_target=total_needed,
     )
     cases = [IssueCase(**item) for item in raw[:total_needed]]
