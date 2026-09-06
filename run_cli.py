@@ -19,6 +19,7 @@ import argparse
 import os
 import sys
 
+import neatlogs
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +29,8 @@ load_dotenv()
 # print of a learned memory). Route console output through UTF-8 instead.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+neatlogs.init(workflow_name="issue-triage-cli")
 
 import state_store
 
@@ -201,26 +204,34 @@ def main():
             )
 
     if args.experiment:
-        final_state, experiment = run_learning_experiment(
-            args.owner,
-            args.repo,
-            token,
-            train_batch_size=args.train_batch_size,
-            num_cycles=args.cycles,
-            eval_size=args.eval_size,
-            on_round=on_round,
-        )
+        try:
+            final_state, experiment = run_learning_experiment(
+                args.owner,
+                args.repo,
+                token,
+                train_batch_size=args.train_batch_size,
+                num_cycles=args.cycles,
+                eval_size=args.eval_size,
+                on_round=on_round,
+            )
+        finally:
+            neatlogs.flush()
+            neatlogs.shutdown()
         print_experiment_report(experiment)
         return
 
-    final_state, history = run_learning_session(
-        args.owner,
-        args.repo,
-        token,
-        num_batches=args.batches,
-        batch_size=args.batch_size,
-        on_step=on_step,
-    )
+    try:
+        final_state, history = run_learning_session(
+            args.owner,
+            args.repo,
+            token,
+            num_batches=args.batches,
+            batch_size=args.batch_size,
+            on_step=on_step,
+        )
+    finally:
+        neatlogs.flush()
+        neatlogs.shutdown()
 
     print("\n" + "=" * 50)
 

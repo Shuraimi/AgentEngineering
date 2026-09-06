@@ -16,16 +16,57 @@ a genuine relative change). Flat results are shown honestly with the explicit
 `No measurable improvement on the fixed held-out evaluation set.` message.
 """
 
+import atexit
 import json
 import os
 from datetime import datetime
 
+import neatlogs
 import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------------------------------------
 # Data access (pure Python + stdlib so tests can import without streamlit-run)
 # ---------------------------------------------------------------------------
+
+neatlogs.init(workflow_name="issue-triage-ui")
+
+
+_neatlogs_shutdown_done = False
+
+
+def _shutdown_neatlogs() -> None:
+    """Flush and stop the Neatlogs exporter once at Streamlit process exit.
+
+    Best-effort and never raises: at interpreter exit stdout may already be
+    closed (e.g. a pytest run that imports this module), and Neatlogs logs its
+    final "shutdown complete" line to stdout via a StreamHandler. Raising the
+    logger level during teardown filters that final info message so a closed
+    stdout can never surface a logging error or crash an atexit hook.
+    """
+    global _neatlogs_shutdown_done
+    if _neatlogs_shutdown_done:
+        return
+    _neatlogs_shutdown_done = True
+    try:
+        import logging
+        root = logging.getLogger("neatlogs")
+        prev_level = root.level
+        try:
+            if prev_level > logging.WARNING:
+                # Already above INFO threshold; leave it alone.
+                root.level = prev_level
+            else:
+                root.setLevel(logging.WARNING)
+            neatlogs.flush()
+            neatlogs.shutdown()
+        finally:
+            root.setLevel(prev_level)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_neatlogs)
 
 DEFAULT_OWNER = "pallets"
 DEFAULT_REPO = "flask"
@@ -434,27 +475,28 @@ def main() -> None:
         render_empty_state()
         return
 
-    render_header(experiment.get("owner", owner), experiment.get("repo", repo))
-    render_summary(experiment)
-    st.divider()
-    render_learning_curve(experiment)
-    st.divider()
-    render_train_vs_eval(experiment)
-    st.divider()
-    render_memory_quality(experiment, state)
-    st.divider()
-    render_tool_performance(experiment)
-    st.divider()
-    render_rounds(experiment)
-    st.divider()
-    render_system_flow()
-    st.divider()
-    render_honest_result(experiment)
+    with neatlogs.trace("issue-triage-session", kind="WORKFLOW"):
+        render_header(experiment.get("owner", owner), experiment.get("repo", repo))
+        render_summary(experiment)
+        st.divider()
+        render_learning_curve(experiment)
+        st.divider()
+        render_train_vs_eval(experiment)
+        st.divider()
+        render_memory_quality(experiment, state)
+        st.divider()
+        render_tool_performance(experiment)
+        st.divider()
+        render_rounds(experiment)
+        st.divider()
+        render_system_flow()
+        st.divider()
+        render_honest_result(experiment)
 
-    st.caption(
-        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
-        "Read-only dashboard — data from experiment.json / state.json."
-    )
+        st.caption(
+            f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
+            "Read-only dashboard — data from experiment.json / state.json."
+        )
 
 
 if __name__ == "__main__":

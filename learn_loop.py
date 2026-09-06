@@ -10,6 +10,7 @@ breaks, you're almost always debugging one of those four, not this glue.
 
 from typing import Callable, Optional
 
+import neatlogs
 import github_tools
 import state_store
 from evaluator import score_case
@@ -101,6 +102,7 @@ def run_time_step(
     )
 
 
+@neatlogs.span(kind="WORKFLOW", name="issue-triage-session", capture_input=False, capture_output=False)
 def run_learning_session(
     owner: str, repo: str, token: Optional[str], num_batches: int = 4, batch_size: int = 6,
     resume: bool = True,
@@ -154,6 +156,7 @@ def _round_metrics(round_type: str, cycle: int, result: BatchResult) -> RoundMet
     )
 
 
+@neatlogs.span(kind="WORKFLOW", name="issue-triage-session", capture_input=False, capture_output=False)
 def run_learning_experiment(
     owner: str, repo: str, token: Optional[str],
     train_batch_size: int = 6, num_cycles: int = 2, eval_size: int = 6,
