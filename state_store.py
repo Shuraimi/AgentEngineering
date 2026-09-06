@@ -4,18 +4,21 @@ reasoning as before: zero schema risk in a short build window).
 
 Layout: data/agents/<owner>_<repo>/state.json          <- current AgentState
         data/agents/<owner>_<repo>/history/step_N.json <- each BatchResult
+        data/agents/<owner>_<repo>/experiment.json     <- last ExperimentResult
 
 Loading `state.json` is literally "resume this agent where it left off" -
 which is the honest, load-bearing proof that memory persists across
-sessions, not just within one run of the loop.
-"""
+sessions, not just within one run of the loop. experiment.json is the single
+source of truth for the learning-metrics report (the Streamlit UI reads it)."""
 
 import json
 import os
 
-from models import AgentState, BatchResult
+from models import AgentState, BatchResult, ExperimentResult
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "agents")
+
+EXPERIMENT_FILENAME = "experiment.json"
 
 
 def _agent_dir(owner: str, repo: str) -> str:
@@ -28,19 +31,22 @@ def load_state(owner: str, repo: str) -> AgentState | None:
     path = os.path.join(_agent_dir(owner, repo), "state.json")
     if not os.path.exists(path):
         return None
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return AgentState(**json.load(f))
 
 
 def save_state(state: AgentState) -> None:
     path = os.path.join(_agent_dir(state.owner, state.repo), "state.json")
-    with open(path, "w") as f:
+    # Windows default encoding is cp1252 and LLM-written memory statements can
+    # contain characters it can't encode (confirmed live: U+2011 crash) - JSON
+    # persistence must always be UTF-8.
+    with open(path, "w", encoding="utf-8") as f:
         f.write(state.model_dump_json(indent=2))
 
 
 def save_batch_result(owner: str, repo: str, result: BatchResult) -> None:
     path = os.path.join(_agent_dir(owner, repo), "history", f"step_{result.step}.json")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(result.model_dump_json(indent=2))
 
 
@@ -49,9 +55,25 @@ def load_history(owner: str, repo: str) -> list[BatchResult]:
     results = []
     for fname in sorted(os.listdir(hist_dir)):
         if fname.startswith("step_") and fname.endswith(".json"):
-            with open(os.path.join(hist_dir, fname)) as f:
+            with open(os.path.join(hist_dir, fname), encoding="utf-8") as f:
                 results.append(BatchResult(**json.load(f)))
     return sorted(results, key=lambda r: r.step)
+
+
+def save_experiment_result(owner: str, repo: str, experiment: ExperimentResult) -> None:
+    path = os.path.join(_agent_dir(owner, repo), EXPERIMENT_FILENAME)
+    # Same UTF-8 rule as state.json - a unicode memory statement in a round
+    # must never crash the persistence on a cp1252 Windows console.
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(experiment.model_dump_json(indent=2))
+
+
+def load_experiment_result(owner: str, repo: str) -> ExperimentResult | None:
+    path = os.path.join(_agent_dir(owner, repo), EXPERIMENT_FILENAME)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return ExperimentResult(**json.load(f))
 
 
 def reset_agent(owner: str, repo: str) -> None:

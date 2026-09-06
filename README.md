@@ -28,7 +28,13 @@ auditable (it's a plain memory file, not a black box).
   memory rather than hiring a new one each time.
 - **Memory grows, it isn't replaced.** Each step's `Reflection` *adds to*
   memory (`reflector.apply_reflection`); existing entries are only touched
-  when explicitly revised. The Streamlit UI charts this growth directly.
+  when explicitly revised. Growth is quality-controlled by a deterministic
+  gate (`memory.py`), not just left to the LLM: duplicate proposals are
+  merged into the existing entry (evidence reinforced), contradictory
+  proposals are detected and resolved as revisions, generic boilerplate is
+  rejected before it enters memory, and only the most relevant entries (per
+  issue, capped) are injected into the worker's prompt. The Streamlit UI
+  charts this growth directly.
 - **Two distinct kinds of learning**, because the brief asks for both:
   `domain_fact` entries (what's true about *this repo*) and `tool_usage`
   entries (what works when calling *these tools*) — see `reflector.py`.
