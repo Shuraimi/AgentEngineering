@@ -257,20 +257,68 @@ def render_learning_curve(experiment: dict) -> None:
     if baseline is None and not cycle_accuracy:
         st.caption("No accuracy data available.")
         return
-    data = {"Point": [], "Accuracy": []}
-    if baseline is not None:
-        data["Point"].append("Baseline")
-        data["Accuracy"].append(float(baseline))
-    # Purely label plotting — "Cycle N" evaluation accuracy for the held-out set.
-    for i, acc in enumerate(cycle_accuracy, start=1):
-        data["Point"].append(f"Cycle {i}")
-        data["Accuracy"].append(float(acc))
-    df = pd.DataFrame(data)
-    st.line_chart(df.set_index("Point")["Accuracy"])
-    st.caption(
-        "Baseline (dashed) followed by Cycle 1..N evaluation accuracy on the "
-        "fixed held-out set. Plotted honestly — no smoothing."
+
+    # Cycle evaluation points only — plotted exactly as stored, no smoothing.
+    points = pd.DataFrame(
+        {
+            "Cycle": [f"Cycle {i}" for i in range(1, len(cycle_accuracy) + 1)],
+            "Accuracy": [float(a) for a in cycle_accuracy],
+        }
     )
+
+    try:
+        import altair as alt
+
+        chart = (
+            alt.Chart(points)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Cycle:N", sort=None, title="Learning Cycle"),
+                y=alt.Y("Accuracy:Q", scale=alt.Scale(zero=False), title="Evaluation Accuracy"),
+                tooltip=["Cycle", "Accuracy"],
+            )
+        )
+        if baseline is not None:
+            # Dashed horizontal reference line — visually distinct baseline.
+            baseline_df = pd.DataFrame({"Accuracy": [float(baseline)]})
+            baseline_rule = (
+                alt.Chart(baseline_df)
+                .mark_rule(strokeDash=[6, 4], color="#FF4B4B", size=1.5)
+                .encode(
+                    y="Accuracy:Q",
+                    tooltip=alt.Tooltip("Accuracy:Q", title="Baseline Accuracy"),
+                )
+            )
+            st.altair_chart(
+                (baseline_rule + chart).properties(height=380),
+                width="stretch",
+            )
+            st.caption(
+                f"Red dashed line = baseline ({pct(baseline)}), followed by "
+                f"Cycle 1..{len(cycle_accuracy)} evaluation accuracy on the fixed "
+                "held-out set. Plotted honestly — no smoothing."
+            )
+        else:
+            st.altair_chart(chart.properties(height=380), width="stretch")
+            st.caption(
+                "Cycle 1..N evaluation accuracy on the fixed held-out set. "
+                "Plotted honestly — no smoothing."
+            )
+    except ImportError:
+        # Altair unavailable — fall back to a plain line chart (still honest).
+        data = {"Point": [], "Accuracy": []}
+        if baseline is not None:
+            data["Point"].append("Baseline")
+            data["Accuracy"].append(float(baseline))
+        for i, acc in enumerate(cycle_accuracy, start=1):
+            data["Point"].append(f"Cycle {i}")
+            data["Accuracy"].append(float(acc))
+        df = pd.DataFrame(data)
+        st.line_chart(df.set_index("Point")["Accuracy"])
+        st.caption(
+            "Baseline followed by Cycle 1..N evaluation accuracy on the fixed "
+            "held-out set. Plotted honestly — no smoothing."
+        )
 
 
 def render_train_vs_eval(experiment: dict) -> None:
