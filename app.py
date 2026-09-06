@@ -1,148 +1,413 @@
 """
-AgentForge Streamlit UI - GitHub Issue Triage edition.
+AgentForge Streamlit Dashboard — READ-ONLY.
 
-Same design principle as before: call the individual pieces of the loop
-(run_time_step, reflect, apply_reflection) one step at a time from inside
-this script, rather than one black-box function, so Streamlit renders each
-step LIVE as it happens - the accuracy climbing, the memory panel growing -
-instead of showing a spinner and dumping everything at the end.
+A thin visualization layer over the two persisted artifact files:
+  data/agents/<owner>_<repo>/experiment.json
+  data/agents/<owner>_<repo>/state.json
+
+This file does NOT run the backend, does NOT modify any backend module, and
+does NOT hardcode any metrics. Everything rendered on screen is read from the
+JSON files at runtime. If either file is missing or malformed the dashboard
+shows a graceful empty state instead of crashing.
+
+Accuracy improvements are always shown in PERCENTAGE POINTS (pp). A move from
+30.6% to 41.7% is displayed as "+11.1 pp", never "+11.1%" (unless the value is
+a genuine relative change). Flat results are shown honestly with the explicit
+`No measurable improvement on the fixed held-out evaluation set.` message.
 """
 
+import json
 import os
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Data access (pure Python + stdlib so tests can import without streamlit-run)
+# ---------------------------------------------------------------------------
 
-import state_store
-from github_tools import fetch_repo_labels
-from learn_loop import DEFAULT_LABEL_POOL_SIZE, prepare_dataset, run_time_step
-from reflector import apply_reflection, build_initial_state, reflect
+DEFAULT_OWNER = "pallets"
+DEFAULT_REPO = "flask"
 
-st.set_page_config(page_title="AgentForge — GitHub Triage", layout="wide")
-st.title("🔨 AgentForge — an agent that learns to triage YOUR repo's issues over time")
-st.caption(
-    "Point it at a real GitHub repo. It replays real historical closed issues in "
-    "time order, predicts labels using the repo's own tools, checks itself against "
-    "what the maintainers actually labeled them, and grows a persistent memory of "
-    "what it's learned — both about the repo's conventions and about using its tools well."
+HONEST_RESULT_MESSAGE = (
+    "No measurable improvement on the fixed held-out evaluation set."
 )
 
-with st.sidebar:
-    st.header("Session configuration")
-    owner = st.text_input("Repo owner", value="pallets")
-    repo = st.text_input("Repo name", value="flask")
-    num_batches = st.slider("Time steps (batches)", 2, 8, 4)
-    batch_size = st.slider("Issues per step", 3, 12, 6)
-    token_from_env = os.environ.get("GITHUB_TOKEN")
-    st.caption(
-        "✅ GITHUB_TOKEN found in environment" if token_from_env
-        else "⚠️ No GITHUB_TOKEN set — unauthenticated GitHub API limits are tight (60/hr)."
-    )
-    st.divider()
-    if st.button("🗑️ Reset this agent's memory"):
-        state_store.reset_agent(owner, repo)
-        st.success(f"Reset agent for {owner}/{repo}. It will start fresh next run.")
 
-existing_state = state_store.load_state(owner, repo)
-if existing_state:
-    st.info(f"Resuming existing agent for **{owner}/{repo}** — "
-            f"already at step {existing_state.step} with {len(existing_state.memory)} learned memory entries.")
-else:
-    st.info(f"No existing agent for **{owner}/{repo}** yet — this run starts one from scratch.")
+def data_dir(owner: str = DEFAULT_OWNER, repo: str = DEFAULT_REPO) -> str:
+    """Absolute path to the persisted artifacts for a given owner/repo."""
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "agents")
+    return os.path.join(base, f"{owner}_{repo}")
 
-run_clicked = st.button("🚀 Run learning session", type="primary")
 
-if run_clicked:
-    token = token_from_env
-    with st.spinner("Fetching real labels + historical labeled issues from GitHub..."):
-        try:
-            labels, cases = prepare_dataset(owner, repo, token, num_batches, batch_size)
-        except Exception as e:
-            st.error(f"Couldn't fetch data from GitHub: {e}")
-            st.stop()
+def experiment_path(owner: str = DEFAULT_OWNER, repo: str = DEFAULT_REPO) -> str:
+    return os.path.join(data_dir(owner, repo), "experiment.json")
 
-    if len(cases) < batch_size:
-        st.warning(f"Only found {len(cases)} labeled historical issues for the top "
-                   f"{DEFAULT_LABEL_POOL_SIZE} labels — try a more active repo or a smaller batch size.")
-        st.stop()
 
-    state = existing_state or build_initial_state(owner, repo, labels)
-    if existing_state is None:
-        state_store.save_state(state)
+def state_path(owner: str = DEFAULT_OWNER, repo: str = DEFAULT_REPO) -> str:
+    return os.path.join(data_dir(owner, repo), "state.json")
 
-    with st.expander("Repo labels this agent is choosing between"):
-        st.write(", ".join(f"`{l['name']}`" for l in labels[:DEFAULT_LABEL_POOL_SIZE]))
-    with st.expander("Core instructions (stable — should rarely change)"):
-        st.code(state.core_instructions)
 
-    batches = [cases[i:i + batch_size] for i in range(0, len(cases), batch_size)][:num_batches]
-    history = []
-    progress_area = st.container()
+def _load_json(path: str) -> dict | None:
+    """Return parsed JSON dict, or None if file missing/malformed/empty."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) and data else None
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
 
-    for batch in batches:
-        if not batch:
+
+def load_experiment(owner: str = DEFAULT_OWNER, repo: str = DEFAULT_REPO) -> dict | None:
+    """Read + parse experiment.json. Returns None on missing/malformed file."""
+    return _load_json(experiment_path(owner, repo))
+
+
+def load_state(owner: str = DEFAULT_OWNER, repo: str = DEFAULT_REPO) -> dict | None:
+    """Read + parse state.json. Returns None on missing/malformed file."""
+    return _load_json(state_path(owner, repo))
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers (pp = percentage points)
+# ---------------------------------------------------------------------------
+
+
+def pct(accuracy: float | None) -> str:
+    """Format a 0-1 accuracy as a percentage string."""
+    if accuracy is None:
+        return "—"
+    return f"{accuracy * 100:.1f}%"
+
+
+def pp(delta_pp: float | None) -> str:
+    """
+    Format an improvement given in PERCENTAGE POINTS.
+
+    A value of 11.1 means the accuracy rose by 11.1 percentage points → renders
+    as "+11.1 pp". A value of 0 (flat) renders as "0 pp". A negative value is
+    shown as its own sign, e.g. "-2.8 pp".
+    """
+    if delta_pp is None:
+        return "—"
+    if delta_pp == 0:
+        return "0 pp"
+    return f"{delta_pp:+.1f} pp"
+
+
+def improvement_from_baseline_pp(experiment: dict) -> float:
+    """
+    Return the improvement of the LAST cycle_eval over the baseline, in
+    percentage points. Falls back to 0.0 when no data is available.
+    """
+    baseline = experiment.get("baseline_accuracy")
+    cycles = experiment.get("cycle_accuracy") or []
+    if baseline is None or not cycles:
+        return 0.0
+    # Already stored as pp floats; the last element is the most recent eval.
+    stored = experiment.get("improvement_from_baseline") or []
+    if stored:
+        return float(stored[-1])
+    return (float(cycles[-1]) - float(baseline)) * 100.0
+
+
+def is_flat(experiment: dict) -> bool:
+    """True when there is no measurable improvement on the held-out eval set."""
+    return improvement_from_baseline_pp(experiment) <= 0
+
+
+def current_eval_accuracy(experiment: dict) -> float | None:
+    """Accuracy of the last cycle_eval round, else the last stored eval acc."""
+    rounds = experiment.get("rounds") or []
+    eval_rounds = [r for r in rounds if r.get("round_type") == "cycle_eval"]
+    if eval_rounds:
+        return float(eval_rounds[-1].get("accuracy"))
+    cycles = experiment.get("cycle_accuracy") or []
+    if cycles:
+        return float(cycles[-1])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pure data-extraction helpers (used by both the UI and the tests)
+# ---------------------------------------------------------------------------
+
+
+def memory_counts(experiment: dict) -> dict:
+    """memory size + added/merged/revised/rejected counts from experiment."""
+    return {
+        "added": experiment.get("memory_added", 0),
+        "merged": experiment.get("memory_merged", 0),
+        "revised": experiment.get("memory_revised", 0),
+        "rejected": experiment.get("memory_rejected", 0),
+    }
+
+
+def rounds_frame(experiment: dict) -> pd.DataFrame:
+    """Flatten `rounds` into a tidy DataFrame for the EXPERIMENT ROUNDS table."""
+    rounds = experiment.get("rounds") or []
+    rows = []
+    for r in rounds:
+        rows.append(
+            {
+                "Round": (
+                    "Baseline" if r.get("round_type") == "baseline_eval"
+                    else f"Train Cycle {r.get('cycle')}"
+                    if r.get("round_type") == "train_cycle"
+                    else f"Eval Cycle {r.get('cycle')}"
+                ),
+                "Type": r.get("round_type", ""),
+                "Issue count": len(r.get("issue_numbers") or []),
+                "Accuracy": pct(r.get("accuracy")),
+                "Memory size": r.get("memory_size", 0),
+                "Tool calls": r.get("tool_calls", 0),
+                "Tool errors": r.get("tool_errors", 0),
+                "Latency": f"{r.get('average_latency_s', 0.0):.1f}s",
+                "Cost": f"${r.get('estimated_cost_usd', 0.0):.4f}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def train_eval_frame(experiment: dict) -> pd.DataFrame:
+    """
+    Per-cycle training vs evaluation accuracy (train_cycle vs cycle_eval).
+
+    Returns a DataFrame with columns: Cycle, Train Accuracy, Eval Accuracy.
+    """
+    cycles: dict[int, dict] = {}
+    for r in experiment.get("rounds") or []:
+        cyc = r.get("cycle")
+        acc = r.get("accuracy")
+        if cyc is None or acc is None:
             continue
-        with progress_area:
-            st.markdown(f"### Step {state.step + 1}")
-            with st.spinner(f"Running on {len(batch)} historical issues..."):
-                result = run_time_step(state, batch, owner, repo, token, labels)
+        bucket = cycles.setdefault(cyc, {"train": None, "eval": None})
+        if r.get("round_type") == "train_cycle":
+            bucket["train"] = acc
+        elif r.get("round_type") == "cycle_eval":
+            bucket["eval"] = acc
+    return pd.DataFrame(
+        [
+            {"Cycle": cyc, "Train Accuracy": pct(b["train"]), "Eval Accuracy": pct(b["eval"])}
+            for cyc, b in sorted(cycles.items())
+        ]
+    )
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Accuracy", f"{result.accuracy:.0%}")
-            c2.metric("Avg cost / issue", f"${result.avg_cost_usd:.4f}")
-            c3.metric("Avg latency / issue", f"{result.avg_latency_s:.2f}s")
-            c4.metric("Tool errors", result.tool_error_count)
 
-            with st.spinner("Reflecting on this step's mistakes..."):
-                reflection = reflect(state, result)
-                state = apply_reflection(state, reflection)
+def group_memories(state: dict) -> dict[str, list]:
+    """Split state memory into domain_fact and tool_usage lists."""
+    grouped = {"domain_fact": [], "tool_usage": []}
+    for m in state.get("memory") or []:
+        kind = m.get("kind")
+        if kind in grouped:
+            grouped[kind].append(m)
+        # unknown kinds are ignored rather than crashing
+    return grouped
 
-            state_store.save_state(state)
-            state_store.save_batch_result(owner, repo, result)
-            history.append(result)
 
-            if reflection.memory_additions or reflection.memory_revisions:
-                with st.expander(f"🧠 What it learned this step", expanded=True):
-                    st.write(reflection.summary)
-                    for m in reflection.memory_additions:
-                        st.write(f"➕ **[{m.kind}]** {m.statement}")
-                    for mid, stmt in reflection.memory_revisions.items():
-                        st.write(f"✏️ **[revised {mid}]** {stmt}")
+# ---------------------------------------------------------------------------
+# Streamlit rendering
+# ---------------------------------------------------------------------------
 
+
+def render_empty_state() -> None:
+    st.balloons()
+    st.header("AGENTFORGE")
+    st.subheader("Self-Improving GitHub Issue Triage Agent")
+    st.caption(f"Repository: {DEFAULT_OWNER}/{DEFAULT_REPO}")
     st.divider()
-    st.header("📊 Session report")
-    if len(history) >= 2:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Accuracy", f"{history[-1].accuracy:.0%}",
-                   delta=f"{(history[-1].accuracy - history[0].accuracy):+.0%} vs step 1")
-        c2.metric("Avg cost / issue", f"${history[-1].avg_cost_usd:.4f}",
-                   delta=f"{(history[-1].avg_cost_usd - history[0].avg_cost_usd):+.4f} vs step 1",
-                   delta_color="inverse")
-        c3.metric("Tool errors", history[-1].tool_error_count,
-                   delta=f"{(history[-1].tool_error_count - history[0].tool_error_count):+d} vs step 1",
-                   delta_color="inverse")
+    st.info(
+        "No experiment data yet - run the learning experiment first. "
+        "Once `experiment.json` and `state.json` are written under "
+        "`data/agents/pallets_flask/`, press the **Refresh** button to load them."
+    )
 
-    chart_df = pd.DataFrame({
-        "step": [r.step for r in history],
-        "accuracy": [r.accuracy for r in history],
-        "avg_cost_usd": [r.avg_cost_usd for r in history],
-        "memory_size": [r.memory_size_before for r in history[1:]] + [len(state.memory)] if history else [],
-    }).set_index("step")
-    st.subheader("Accuracy over time")
-    st.line_chart(chart_df[["accuracy"]])
-    st.subheader("Cost per issue over time")
-    st.line_chart(chart_df[["avg_cost_usd"]])
-    st.subheader("Memory size over time (the growth the judges want to see)")
-    st.bar_chart(chart_df[["memory_size"]])
 
-    st.subheader("Full current memory")
-    if state.memory:
-        st.dataframe(pd.DataFrame([m.model_dump() for m in state.memory]))
+def render_header(owner: str, repo: str) -> None:
+    st.set_page_config(page_title="AgentForge — Dashboard", layout="wide")
+    st.title("AGENTFORGE")
+    st.subheader("Self-Improving GitHub Issue Triage Agent")
+    st.caption(f"Repository: {owner}/{repo}")
+
+
+def render_summary(experiment: dict) -> None:
+    st.header("EXPERIMENT SUMMARY")
+    b = st.columns(6)
+    baseline = experiment.get("baseline_accuracy")
+    current = current_eval_accuracy(experiment)
+    delta = improvement_from_baseline_pp(experiment)
+    eval_issue_numbers = experiment.get("eval_issue_numbers") or []
+    memory = memory_counts(experiment)
+    b[0].metric("Baseline Accuracy", pct(baseline))
+    b[1].metric("Current Evaluation Accuracy", pct(current))
+    b[2].metric("Improvement from Baseline", pp(delta))
+    b[3].metric("Number of Learning Cycles", int(experiment.get("num_cycles", 0)))
+    b[4].metric("Evaluation Set Size", len(eval_issue_numbers))
+    b[5].metric("Memory Size", memory["added"])
+
+
+def render_learning_curve(experiment: dict) -> None:
+    st.header("LEARNING CURVE")
+    baseline = experiment.get("baseline_accuracy")
+    cycle_accuracy = experiment.get("cycle_accuracy") or []
+    st.subheader("Evaluation Accuracy Over Time")
+    if baseline is None and not cycle_accuracy:
+        st.caption("No accuracy data available.")
+        return
+    data = {"Point": [], "Accuracy": []}
+    if baseline is not None:
+        data["Point"].append("Baseline")
+        data["Accuracy"].append(float(baseline))
+    # Purely label plotting — "Cycle N" evaluation accuracy for the held-out set.
+    for i, acc in enumerate(cycle_accuracy, start=1):
+        data["Point"].append(f"Cycle {i}")
+        data["Accuracy"].append(float(acc))
+    df = pd.DataFrame(data)
+    st.line_chart(df.set_index("Point")["Accuracy"])
+    st.caption(
+        "Baseline (dashed) followed by Cycle 1..N evaluation accuracy on the "
+        "fixed held-out set. Plotted honestly — no smoothing."
+    )
+
+
+def render_train_vs_eval(experiment: dict) -> None:
+    st.header("TRAIN VS EVALUATION")
+    frame = train_eval_frame(experiment)
+    if frame.empty:
+        st.caption("No per-cycle train/eval rounds available.")
+        return
+    st.dataframe(frame, width="stretch")
+
+
+def render_memory_quality(experiment: dict, state: dict | None) -> None:
+    st.header("MEMORY QUALITY")
+    counts = memory_counts(experiment)
+    c = st.columns(4)
+    c[0].metric("Memory Size", counts["added"])
+    c[1].metric("Created", counts["added"])
+    c[2].metric("Merged", counts["merged"])
+    c[3].metric("Rejected", counts["rejected"])
+    if counts["revised"]:
+        st.caption(f"Revised: {counts['revised']}")
+
+    if not state or not state.get("memory"):
+        st.caption("No memory entries yet.")
+        return
+
+    grouped = group_memories(state)
+    st.subheader("DOMAIN FACTS")
+    for m in grouped["domain_fact"]:
+        _memory_card(m)
+    st.subheader("TOOL USAGE")
+    for m in grouped["tool_usage"]:
+        _memory_card(m)
+
+
+def _memory_card(m: dict) -> None:
+    st.markdown(
+        f"- **{m.get('statement', '')}** "
+        f"_(evidence ×{m.get('evidence_count', 0)}, "
+        f"created@step {m.get('created_at_step', 0)}, "
+        f"last reinforced@step {m.get('last_reinforced_step', 0)})_"
+    )
+
+
+def render_tool_performance(experiment: dict) -> None:
+    st.header("TOOL PERFORMANCE")
+    calls = int(experiment.get("tool_calls", 0))
+    errors = int(experiment.get("tool_errors", 0))
+    error_rate = (errors / calls * 100.0) if calls else 0.0
+    eval_count = len(experiment.get("eval_issue_numbers") or [])
+    calls_per_issue = (calls / eval_count) if eval_count else 0.0
+    c = st.columns(5)
+    c[0].metric("Total Tool Calls", calls)
+    c[1].metric("Tool Errors", errors)
+    c[2].metric("Tool Error Rate", f"{error_rate:.2f}%")
+    c[3].metric("Avg Calls / Issue", f"{calls_per_issue:.2f}")
+    c[4].metric("Average Latency", f"{float(experiment.get('average_latency', 0.0)):.1f}s")
+    st.metric("Estimated Cost", f"${float(experiment.get('estimated_cost', 0.0)):.4f}")
+
+
+def render_rounds(experiment: dict) -> None:
+    st.header("EXPERIMENT ROUNDS")
+    frame = rounds_frame(experiment)
+    if frame.empty:
+        st.caption("No rounds recorded yet.")
     else:
-        st.caption("No memory accumulated yet.")
+        st.dataframe(frame, width="stretch", hide_index=True)
 
-    with st.expander("Full case-by-case results (final step)"):
-        st.dataframe(pd.DataFrame([c.model_dump() for c in history[-1].cases]))
+
+def render_system_flow() -> None:
+    st.header("SYSTEM FLOW")
+    flow = [
+        "GitHub Issues",
+        "Worker Agent",
+        "GitHub Tools",
+        "Prediction",
+        "Deterministic Evaluation",
+        "Reflection",
+        "Memory Quality Gate",
+        "Persistent Memory",
+        "Next Learning Cycle ↗",
+    ]
+    st.markdown("→ ".join(flow))
+
+
+def render_honest_result(experiment: dict) -> None:
+    st.header("HONEST RESULT")
+    if is_flat(experiment):
+        st.warning(HONEST_RESULT_MESSAGE)
+    else:
+        delta = improvement_from_baseline_pp(experiment)
+        st.success(f"Measured improvement: {pp(delta)} vs baseline.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    owner = DEFAULT_OWNER
+    repo = DEFAULT_REPO
+
+    # Refresh re-reads the persisted files from disk each time it is pressed.
+    if st.button("↻ Refresh", help="Re-read experiment.json and state.json from disk"):
+        st.cache_data.clear()
+
+    experiment = load_experiment(owner, repo)
+    state = load_state(owner, repo)
+
+    if experiment is None:
+        # Missing/malformed → graceful empty state, never crash.
+        render_empty_state()
+        return
+
+    render_header(experiment.get("owner", owner), experiment.get("repo", repo))
+    render_summary(experiment)
+    st.divider()
+    render_learning_curve(experiment)
+    st.divider()
+    render_train_vs_eval(experiment)
+    st.divider()
+    render_memory_quality(experiment, state)
+    st.divider()
+    render_tool_performance(experiment)
+    st.divider()
+    render_rounds(experiment)
+    st.divider()
+    render_system_flow()
+    st.divider()
+    render_honest_result(experiment)
+
+    st.caption(
+        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · "
+        "Read-only dashboard — data from experiment.json / state.json."
+    )
+
+
+if __name__ == "__main__":
+    main()
