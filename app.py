@@ -98,19 +98,26 @@ if run_clicked:
 
             with st.spinner("Reflecting on this step's mistakes..."):
                 reflection = reflect(state, result)
-                state = apply_reflection(state, reflection)
+                state, change = apply_reflection(state, reflection)
 
             state_store.save_state(state)
             state_store.save_batch_result(owner, repo, result)
             history.append(result)
 
-            if reflection.memory_additions or reflection.memory_revisions:
+            if (reflection.memory_additions or reflection.memory_revisions
+                    or change.rejected or change.merged):
                 with st.expander(f"🧠 What it learned this step", expanded=True):
                     st.write(reflection.summary)
                     for m in reflection.memory_additions:
                         st.write(f"➕ **[{m.kind}]** {m.statement}")
                     for mid, stmt in reflection.memory_revisions.items():
                         st.write(f"✏️ **[revised {mid}]** {stmt}")
+                    if change.merged:
+                        st.write(f"🔁 **Merged duplicates ({len(change.merged)}):** "
+                                 f"{'; '.join(change.merged[:5])}")
+                    if change.rejected:
+                        st.write(f"🚫 **Rejected ({len(change.rejected)}):** "
+                                 + "; ".join(f"`{s}` ({r})" for s, r in change.rejected[:5]))
 
     st.divider()
     st.header("📊 Session report")

@@ -21,10 +21,28 @@ more than you need"). It has two jobs:
 
 import uuid
 
+import memory
 from llm_client import call_for_json
-from models import AgentState, BatchResult, MemoryEntry, Reflection
+from models import (
+    AgentState,
+    BatchResult,
+    MemoryChange,
+    MemoryEntry,
+    Reflection,
+)
 
 FAILURE_THRESHOLD = 0.5
+MAX_ADDITIONS_PER_REFLECTION = 3  # the quality gate also enforces a global cap
+
+# The EXACT tool signatures the worker can call. Shown to the Reflector so a
+# tool_usage lesson it writes matches reality - without this it has invented
+# wrong arguments (e.g. "call list_labels(issue_number)"), which then taught
+# the worker to make tool calls that fail.
+TOOLS_DESCRIPTION = (
+    "The worker's ONLY tools are:\n"
+    "  - list_labels(): takes NO arguments. Returns the repo's exact valid label names.\n"
+    "  - search_similar_issues(query: str): searches past closed issues for precedent."
+)
 
 INIT_PROMPT_TEMPLATE = """You are writing the initial system instructions for an AI \
 agent whose job is to triage incoming GitHub issues on the repo {owner}/{repo} by \
@@ -42,8 +60,7 @@ Return ONLY JSON: {{"core_instructions": "..."}}
 """
 
 REFLECT_PROMPT_TEMPLATE = """You are improving a GitHub issue-triage agent by learning \
-from its mistakes. Here is what it currently "knows" (its memory):
-
+from its mistakes. Here is what it currently "knows" (its memory, with evidence counts):
 {current_memory}
 
 Here are cases from its most recent batch where it scored poorly (expected labels vs. \
@@ -51,13 +68,21 @@ what it predicted, plus the tools it called and any tool errors):
 
 {failing_cases}
 
+{TOOLS_DESCRIPTION}
+
 Diagnose the root causes. Then propose:
-  - memory_additions: NEW general, reusable lessons (not quotes of specific issues) \
-that would help on FUTURE issues. Tag each as "domain_fact" (something true about \
-this repo's own conventions) or "tool_usage" (something about using the tools \
-effectively, e.g. a tool_error pattern to avoid repeating).
+  - memory_additions: at most 3 NEW general, reusable lessons (not quotes of specific \
+issues) that would help on FUTURE issues. Tag each as "domain_fact" (something true \
+about this repo's own conventions) or "tool_usage" (something about using the tools \
+effectively, e.g. a tool_error pattern to avoid repeating). Be SPECIFIC to this repo: \
+name the actual labels or tool behaviors involved. Do NOT repeat a lesson that is \
+already in memory, do NOT add generic advice ("read the issue carefully", "be \
+thoughtful") that would apply to any repo, and do NOT propose something that \
+contradicts an existing entry - if an existing entry is wrong, correct it via \
+memory_revisions instead.
   - memory_revisions: if any EXISTING memory statement (by id, given above) turned \
-out to be wrong or too narrow, give its id and a corrected statement.
+out to be wrong or too narrow, give its id and a corrected statement. Only reference \
+ids that actually appear in the memory list above.
   - instruction_patch: ONLY if the failures point to a structural/format problem \
 (e.g. it keeps returning malformed output) rather than a knowledge gap. Otherwise null.
 
@@ -80,7 +105,10 @@ def build_initial_state(owner: str, repo: str, labels: list[dict]) -> AgentState
 def _render_memory_for_prompt(state: AgentState) -> str:
     if not state.memory:
         return "(empty - this is the first batch)"
-    return "\n".join(f"[{m.id}] ({m.kind}) {m.statement}" for m in state.memory)
+    return "\n".join(
+        f"[{m.id}] ({m.kind}, evidence={m.evidence_count}) {m.statement}"
+        for m in state.memory
+    )
 
 
 def _render_failing_cases(batch: BatchResult) -> str:
@@ -106,14 +134,42 @@ def reflect(state: AgentState, batch: BatchResult) -> Reflection:
     prompt = REFLECT_PROMPT_TEMPLATE.format(
         current_memory=_render_memory_for_prompt(state),
         failing_cases=_render_failing_cases(batch),
+        TOOLS_DESCRIPTION=TOOLS_DESCRIPTION,
     )
-    data = call_for_json(prompt)
+    try:
+        data = call_for_json(prompt)
+    except Exception:
+        # The hosted model occasionally returns empty content (confirmed live:
+        # 'Could not find JSON in model response' twice). Retry once, then
+        # degrade to a no-op reflection rather than killing the whole session
+        # and losing the step's persisted state.
+        try:
+            data = call_for_json(prompt)
+        except Exception:
+            return Reflection(
+                summary=(
+                    "Reflection LLM call failed twice (empty/invalid JSON); "
+                    "memory left unchanged this step."
+                ),
+            )
 
-    additions = [
-        MemoryEntry(id=uuid.uuid4().hex[:8], kind=a["kind"], statement=a["statement"],
-                    created_at_step=state.step + 1, last_reinforced_step=state.step + 1)
-        for a in data.get("memory_additions", [])
-    ]
+    additions = []
+    raw_additions = data.get("memory_additions", []) or []
+    if not isinstance(raw_additions, list):
+        raw_additions = []
+    for a in raw_additions[:MAX_ADDITIONS_PER_REFLECTION]:
+        if not isinstance(a, dict):
+            continue
+        statement = str(a.get("statement", "")).strip()
+        if not statement:
+            continue
+        kind = a.get("kind")
+        if kind not in ("domain_fact", "tool_usage"):
+            kind = "domain_fact"  # be forgiving: a bad kind shouldn't kill the step
+        additions.append(MemoryEntry(
+            id=uuid.uuid4().hex[:8], kind=kind, statement=statement,
+            created_at_step=state.step + 1, last_reinforced_step=state.step + 1,
+        ))
     return Reflection(
         summary=data.get("summary", ""),
         memory_additions=additions,
@@ -122,16 +178,67 @@ def reflect(state: AgentState, batch: BatchResult) -> Reflection:
     )
 
 
-def apply_reflection(state: AgentState, reflection: Reflection) -> AgentState:
-    """Applies a Reflection to produce the NEXT state. Additive by default -
-    memory grows; existing entries are only touched if explicitly revised."""
-    new_memory = list(state.memory)
-    revised_ids = set(reflection.memory_revisions.keys())
-    for m in new_memory:
-        if m.id in revised_ids:
-            m.statement = reflection.memory_revisions[m.id]
-            m.last_reinforced_step = state.step + 1
-    new_memory.extend(reflection.memory_additions)
+def apply_reflection(state: AgentState, reflection: Reflection) -> tuple[AgentState, MemoryChange]:
+    """
+    Applies a Reflection to produce the NEXT state, running every proposed
+    change through the deterministic quality gate in memory.py:
+
+      - additions that duplicate an existing entry are MERGED (evidence bump,
+        no new entry);
+      - additions that contradict an existing entry are resolved as a
+        REVISION (the newer, evidence-informed statement replaces the old);
+      - generic boilerplate and overflow beyond the memory cap are REJECTED;
+      - explicit memory_revisions are applied only when the id actually exists.
+
+    Returns (next_state, MemoryChange) so callers can report exactly what was
+    created / merged / revised / rejected instead of guessing from size deltas.
+    """
+    new_memory = [m.model_copy(deep=True) for m in state.memory]
+    change = MemoryChange()
+    step = state.step + 1
+
+    # 1) Explicit LLM revisions: only apply to ids that actually exist.
+    for mid, new_statement in (reflection.memory_revisions or {}).items():
+        target = next((m for m in new_memory if m.id == mid), None)
+        if target is None:
+            change.dropped_revisions.append(mid)
+            continue
+        target.statement = new_statement
+        target.last_reinforced_step = step
+        change.revised.append(mid)
+
+    # 2) Proposed additions through the quality gate.
+    for addition in reflection.memory_additions:
+        if memory.is_generic(addition.statement):
+            change.rejected.append((addition.statement, "generic"))
+            continue
+
+        duplicate = next(
+            (m for m in new_memory if memory.is_duplicate(m.statement, addition.statement)),
+            None,
+        )
+        if duplicate is not None:
+            duplicate.evidence_count += 1
+            duplicate.last_reinforced_step = step
+            change.merged.append(addition.statement)
+            continue
+
+        contradiction = next(
+            (m for m in new_memory if memory.is_contradiction(m.statement, addition.statement)),
+            None,
+        )
+        if contradiction is not None:
+            contradiction.statement = addition.statement
+            contradiction.last_reinforced_step = step
+            change.revised.append(contradiction.id)
+            continue
+
+        if len(new_memory) >= memory.MAX_MEMORY_SIZE:
+            change.rejected.append((addition.statement, "memory cap"))
+            continue
+
+        new_memory.append(addition)
+        change.created.append(addition.id)
 
     new_instructions = reflection.instruction_patch or state.core_instructions
 
@@ -139,5 +246,5 @@ def apply_reflection(state: AgentState, reflection: Reflection) -> AgentState:
         owner=state.owner, repo=state.repo,
         core_instructions=new_instructions,
         memory=new_memory,
-        step=state.step + 1,
-    )
+        step=step,
+    ), change

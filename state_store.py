@@ -28,19 +28,22 @@ def load_state(owner: str, repo: str) -> AgentState | None:
     path = os.path.join(_agent_dir(owner, repo), "state.json")
     if not os.path.exists(path):
         return None
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return AgentState(**json.load(f))
 
 
 def save_state(state: AgentState) -> None:
     path = os.path.join(_agent_dir(state.owner, state.repo), "state.json")
-    with open(path, "w") as f:
+    # Windows default encoding is cp1252 and LLM-written memory statements can
+    # contain characters it can't encode (confirmed live: U+2011 crash) - JSON
+    # persistence must always be UTF-8.
+    with open(path, "w", encoding="utf-8") as f:
         f.write(state.model_dump_json(indent=2))
 
 
 def save_batch_result(owner: str, repo: str, result: BatchResult) -> None:
     path = os.path.join(_agent_dir(owner, repo), "history", f"step_{result.step}.json")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(result.model_dump_json(indent=2))
 
 
@@ -49,7 +52,7 @@ def load_history(owner: str, repo: str) -> list[BatchResult]:
     results = []
     for fname in sorted(os.listdir(hist_dir)):
         if fname.startswith("step_") and fname.endswith(".json"):
-            with open(os.path.join(hist_dir, fname)) as f:
+            with open(os.path.join(hist_dir, fname), encoding="utf-8") as f:
                 results.append(BatchResult(**json.load(f)))
     return sorted(results, key=lambda r: r.step)
 

@@ -95,5 +95,24 @@ class Reflection(BaseModel):
     instruction_patch: Optional[str] = None   # rare - only for structural/format fixes
 
 
+class MemoryChange(BaseModel):
+    """
+    What actually HAPPENED to memory when a Reflection was applied, after the
+    deterministic quality gate (memory.py) disposed of the model's proposals:
+
+      - created:    ids of brand-new entries that entered memory
+      - merged:     proposed statements absorbed into an existing duplicate
+      - revised:    ids of existing entries whose statement was corrected
+                    (explicit LLM revision OR contradiction resolution)
+      - rejected:   (statement, reason) - generic boilerplate or cap overflow
+      - dropped_revisions: revision ids the model referenced that don't exist
+    """
+    created: list[str] = Field(default_factory=list)
+    merged: list[str] = Field(default_factory=list)
+    revised: list[str] = Field(default_factory=list)
+    rejected: list[tuple[str, str]] = Field(default_factory=list)
+    dropped_revisions: list[str] = Field(default_factory=list)
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
