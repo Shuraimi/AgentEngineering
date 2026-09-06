@@ -71,7 +71,7 @@ def _extract_json(text: str) -> Any:
     return json.loads(text[start:end + 1])
 
 
-def call_for_json(prompt: str, max_tokens: int = 1500) -> dict:
+def call_for_json(prompt: str, max_tokens: int = 4096) -> dict:
     """
     Call the configured OpenAI-compatible model and return a parsed JSON dict.
 
@@ -92,7 +92,16 @@ def call_for_json(prompt: str, max_tokens: int = 1500) -> dict:
             temperature=0.2,
             max_tokens=max_tokens,
         )
-        raw = response.choices[0].message.content or ""
+        message = response.choices[0].message
+        raw = message.content or ""
+
+        # GPT-OSS can expose its harmony/reasoning channel markers in
+        # message.content on some hosted NIM responses. Keep only the final
+        # answer portion when those markers are present.
+        if "<|channel|>final" in raw:
+            raw = raw.split("<|channel|>final", 1)[1]
+        raw = raw.replace("<|message|>", "").strip()
+
         parsed = _extract_json(raw)
         if not isinstance(parsed, dict):
             raise ValueError("Expected a JSON object from the model.")
@@ -100,11 +109,18 @@ def call_for_json(prompt: str, max_tokens: int = 1500) -> dict:
 
     try:
         return _attempt()
-    except (json.JSONDecodeError, ValueError):
-        return _attempt(
-            "\n\nIMPORTANT: your previous response was not valid JSON. "
-            "Respond with ONLY one valid JSON object. No prose and no markdown fences."
-        )
+    except (json.JSONDecodeError, ValueError) as first_error:
+        try:
+            return _attempt(
+                "\n\nIMPORTANT: your previous response was not valid JSON. "
+                "Return ONLY the requested JSON object. Do not explain your answer, "
+                "do not use markdown fences, and keep the JSON concise."
+            )
+        except Exception as second_error:
+            raise ValueError(
+                "The LLM returned invalid/empty JSON twice. "
+                f"First error: {first_error}. Second error: {second_error}"
+            ) from second_error
 
 
 # NVIDIA's hosted gpt-oss-20b endpoint currently exposes a free endpoint.
