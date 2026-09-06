@@ -13,6 +13,7 @@ import os
 import re
 from typing import Any
 
+import neatlogs
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -37,9 +38,11 @@ def get_client() -> OpenAI:
                 "Missing LLM_API_KEY (or NVIDIA_API_KEY). "
                 "Set it in .env before running AgentForge."
             )
-        _client = OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
+        _client = neatlogs.wrap(
+            OpenAI(
+                api_key=API_KEY,
+                base_url=BASE_URL,
+            )
         )
     return _client
 

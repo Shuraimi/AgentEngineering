@@ -4,3 +4,4 @@ streamlit>=1.38
 pandas>=2.2
 python-dotenv>=1.0
 requests>=2.31
+neatlogs>=1.4.21
