@@ -4,18 +4,21 @@ reasoning as before: zero schema risk in a short build window).
 
 Layout: data/agents/<owner>_<repo>/state.json          <- current AgentState
         data/agents/<owner>_<repo>/history/step_N.json <- each BatchResult
+        data/agents/<owner>_<repo>/experiment.json     <- last ExperimentResult
 
 Loading `state.json` is literally "resume this agent where it left off" -
 which is the honest, load-bearing proof that memory persists across
-sessions, not just within one run of the loop.
-"""
+sessions, not just within one run of the loop. experiment.json is the single
+source of truth for the learning-metrics report (the Streamlit UI reads it)."""
 
 import json
 import os
 
-from models import AgentState, BatchResult
+from models import AgentState, BatchResult, ExperimentResult
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "agents")
+
+EXPERIMENT_FILENAME = "experiment.json"
 
 
 def _agent_dir(owner: str, repo: str) -> str:
@@ -55,6 +58,22 @@ def load_history(owner: str, repo: str) -> list[BatchResult]:
             with open(os.path.join(hist_dir, fname), encoding="utf-8") as f:
                 results.append(BatchResult(**json.load(f)))
     return sorted(results, key=lambda r: r.step)
+
+
+def save_experiment_result(owner: str, repo: str, experiment: ExperimentResult) -> None:
+    path = os.path.join(_agent_dir(owner, repo), EXPERIMENT_FILENAME)
+    # Same UTF-8 rule as state.json - a unicode memory statement in a round
+    # must never crash the persistence on a cp1252 Windows console.
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(experiment.model_dump_json(indent=2))
+
+
+def load_experiment_result(owner: str, repo: str) -> ExperimentResult | None:
+    path = os.path.join(_agent_dir(owner, repo), EXPERIMENT_FILENAME)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return ExperimentResult(**json.load(f))
 
 
 def reset_agent(owner: str, repo: str) -> None:
