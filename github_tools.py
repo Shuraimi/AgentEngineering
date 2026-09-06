@@ -24,12 +24,19 @@ token with `repo` or `public_repo` scope and is OFF by default everywhere in
 this project - see the dry_run flag.
 """
 
+import re
 import time
 import requests
 
 from models import ToolCallRecord
 
 GITHUB_API = "https://api.github.com"
+
+# GitHub's Search API rejects these boolean operators (422 "Validation
+# Failed") - it uses implicit AND with space-separated terms instead.
+# LLM-written queries frequently include them, which turns a legit search
+# into a tool error.
+_UNSUPPORTED_OPERATORS = re.compile(r"\b(?:AND|OR|NOT)\b", re.IGNORECASE)
 
 
 def _headers(token: str | None) -> dict:
@@ -92,6 +99,53 @@ def build_historical_dataset(
 # Runtime tools available to the worker agent while it triages ONE issue
 # ---------------------------------------------------------------------------
 
+def sanitize_search_query(query: str) -> str:
+    """
+    Make an LLM-written search query safe to hand to GitHub's Search API.
+
+    Two failure modes killed real tool calls during diagnosis:
+      1. Boolean operators (AND/OR/NOT) - GitHub returns HTTP 422
+         "Validation Failed" for them (it uses implicit AND).
+      2. Unbalanced double quotes - also 422; the lexer never closes the
+         phrase. Strip all quotes (a broader, valid search beats an error).
+
+    Deterministic, dependency-free.
+    """
+    q = query or ""
+    q = _UNSUPPORTED_OPERATORS.sub(" ", q)
+    q = q.replace('"', "")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def _search_error_message(resp: requests.Response) -> str:
+    """
+    Classify a failed GitHub Search API response so the error the worker (and
+    the Reflector) sees names the REAL cause instead of a generic
+    "possibly rate-limited" - otherwise tool_usage memory learns the wrong
+    lesson. GitHub 422 = bad query syntax, 403/429 = rate limit, 401 = auth.
+    """
+    code = resp.status_code
+    detail = ""
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            detail = str(body.get("message", "") or "").strip()
+    except Exception:
+        pass
+
+    if code in (403, 429):
+        return f"SEARCH ERROR: HTTP {code} - rate limited or quota exhausted"
+    if code == 422:
+        reason = detail or "invalid search query syntax"
+        return f"SEARCH ERROR: HTTP 422 - invalid search query syntax ({reason})"
+    if code == 401:
+        return "SEARCH ERROR: HTTP 401 - GITHUB_TOKEN missing, invalid, or expired"
+    if code == 404:
+        return "SEARCH ERROR: HTTP 404 - repo not found or search unavailable"
+    return f"SEARCH ERROR: HTTP {code} - {detail or 'GitHub search failed'}"
+
+
 def build_tool_registry(
     owner: str, repo: str, labels: list[dict], token: str | None,
     before_date: str, exclude_number: int,
@@ -106,7 +160,11 @@ def build_tool_registry(
         return "\n".join(f"- {l['name']}: {l['description']}" for l in labels)
 
     def search_similar_issues(query: str) -> str:
-        search_query = f'repo:{owner}/{repo} is:issue is:closed {query}'
+        clean_query = sanitize_search_query(query)
+        if not clean_query:
+            return ("SEARCH ERROR: empty search query - include keywords from "
+                    "the issue's title or body")
+        search_query = f'repo:{owner}/{repo} is:issue is:closed {clean_query}'
         resp = requests.get(
             f"{GITHUB_API}/search/issues",
             headers=_headers(token),
@@ -114,7 +172,7 @@ def build_tool_registry(
             timeout=15,
         )
         if resp.status_code != 200:
-            return f"SEARCH ERROR: HTTP {resp.status_code} (possibly rate-limited)"
+            return _search_error_message(resp)
         results = []
         for item in resp.json().get("items", []):
             # Temporal cutoff: only issues strictly before this one, and not itself.

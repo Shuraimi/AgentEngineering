@@ -8,7 +8,8 @@ hosted API. The rest of AgentForge remains provider-independent.
 import json
 import time
 
-from llm_client import get_client, MODEL, estimate_cost_usd
+from llm_client import clean_model_message, clean_tool_name, get_client, MODEL, estimate_cost_usd
+from memory import rank_memories
 from models import AgentState, IssueCase, ToolCallRecord
 
 MAX_TURNS = 6
@@ -20,23 +21,52 @@ FINAL_ANSWER_INSTRUCTION = (
 )
 
 
-def _render_memory(state: AgentState) -> str:
+def _render_memory(state: AgentState, issue_text: str = "") -> str:
+    """
+    Render the LEARNED MEMORY section of the worker prompt.
+
+    Memory is ranked per-issue (relevance first, then reinforcement strength
+    and recency) and capped, so the worker receives the memories that are
+    most relevant to the issue at hand instead of an ever-growing dump.
+    """
     if not state.memory:
         return "(no learned notes yet - this is an early run)"
-    domain = [m.statement for m in state.memory if m.kind == "domain_fact"]
-    tool_usage = [m.statement for m in state.memory if m.kind == "tool_usage"]
+
+    selected = rank_memories(state.memory, issue_text=issue_text)
+    domain = [m for m in selected if m.kind == "domain_fact"]
+    tool_usage = [m for m in selected if m.kind == "tool_usage"]
     parts = []
     if domain:
         parts.append(
-            "Things learned about this repo's own conventions:\n"
-            + "\n".join(f"- {s}" for s in domain)
+            "Things learned about this repo's own conventions "
+            "(reinforced N times):\n"
+            + "\n".join(f"- ({m.evidence_count}x) {m.statement}" for m in domain)
         )
     if tool_usage:
         parts.append(
-            "Things learned about using the tools effectively:\n"
-            + "\n".join(f"- {s}" for s in tool_usage)
+            "Things learned about using the tools effectively "
+            "(reinforced N times):\n"
+            + "\n".join(f"- ({m.evidence_count}x) {m.statement}" for m in tool_usage)
         )
-    return "\n\n".join(parts)
+    text = "\n\n".join(parts)
+    withheld = len(state.memory) - len(selected)
+    if withheld > 0:
+        text += (
+            f"\n\n(Showing the {len(selected)} most relevant learned notes for this "
+            f"issue; {withheld} older/less relevant notes withheld.)"
+        )
+    return text
+
+
+def render_worker_prompt_for_issue(state: AgentState, issue: IssueCase) -> str:
+    """Full system prompt the worker agent sees for ONE issue. Public so tests
+    and experiment probes can verify that learned memory is actually injected."""
+    return (
+        state.core_instructions
+        + "\n\n--- LEARNED MEMORY (apply this) ---\n"
+        + _render_memory(state, issue_text=f"{issue.title}\n{issue.body}")
+        + FINAL_ANSWER_INSTRUCTION
+    )
 
 
 def _openai_tool_schema(anthropic_style_schema: dict) -> dict:
@@ -66,7 +96,7 @@ def _assistant_message_for_history(message) -> dict:
                 "id": tc.id,
                 "type": "function",
                 "function": {
-                    "name": tc.function.name,
+                    "name": clean_tool_name(tc.function.name),
                     "arguments": tc.function.arguments,
                 },
             }
@@ -74,9 +104,21 @@ def _assistant_message_for_history(message) -> dict:
 
     return {
         "role": "assistant",
-        "content": message.content or "",
+        "content": clean_model_message(message.content),
         "tool_calls": tool_calls,
     }
+
+
+def _expected_params(entry: dict) -> str:
+    """Human-readable list of a tool's declared parameters, for error messages
+    that actually teach the model the correct shape (prevents the Reflector
+    from hallucinating a wrong "fix" from a raw Python TypeError)."""
+    if entry is None:
+        return "(unknown tool)"
+    schema = entry.get("schema") or {}
+    input_schema = schema.get("input_schema") or {}
+    props = list((input_schema.get("properties") or {}).keys())
+    return ", ".join(props) if props else "(none - call it with {})"
 
 
 def run_worker_agent(
@@ -87,12 +129,7 @@ def run_worker_agent(
     """Returns predicted_labels, tool_calls, cost_usd, and latency_s."""
     client = get_client()
 
-    system_prompt = (
-        state.core_instructions
-        + "\n\n--- LEARNED MEMORY (apply this) ---\n"
-        + _render_memory(state)
-        + FINAL_ANSWER_INSTRUCTION
-    )
+    system_prompt = render_worker_prompt_for_issue(state, issue)
 
     user_input = (
         f"Issue #{issue.number}\n"
@@ -135,7 +172,7 @@ def run_worker_agent(
         message = response.choices[0].message
 
         if not message.tool_calls:
-            final_text = (message.content or "").strip()
+            final_text = clean_model_message(message.content).strip()
             try:
                 final_text = final_text.strip()
                 if final_text.startswith("```"):
@@ -155,7 +192,10 @@ def run_worker_agent(
 
         # Execute every tool requested in this turn.
         for tool_call in message.tool_calls:
-            name = tool_call.function.name
+            # GPT-OSS can append a harmony channel marker to the function name
+            # (e.g. search_similar_issues<|channel|>commentary) - strip it so
+            # the call resolves instead of erroring with "unknown tool".
+            name = clean_tool_name(tool_call.function.name)
             entry = tools_registry.get(name)
             was_error = False
 
@@ -166,6 +206,35 @@ def run_worker_agent(
                 output = "ERROR: model produced invalid JSON tool arguments"
                 was_error = True
             else:
+                # Confirmed live failure: the model can emit a non-object
+                # argument (e.g. list_labels(1330)). json.loads accepts it,
+                # **-unpacking crashes, and ToolCallRecord.tool_input: dict
+                # then kills the whole run with a pydantic ValidationError.
+                if not isinstance(arguments, dict):
+                    raw = arguments
+                    arguments = {"_raw_args": raw}
+                    output = (
+                        f"ERROR: tool arguments must be a JSON object of "
+                        f"parameters, got {type(raw).__name__} ({raw!r}). "
+                        f"Expected params for {name}: {_expected_params(entry)}"
+                    )
+                    was_error = True
+                    tool_call_records.append(
+                        ToolCallRecord(
+                            tool_name=name,
+                            tool_input=arguments,
+                            tool_output=output,
+                            was_error=was_error,
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": output,
+                        }
+                    )
+                    continue
                 try:
                     if entry is None:
                         output = f"ERROR: unknown tool {name}"
@@ -178,7 +247,10 @@ def run_worker_agent(
                         ):
                             was_error = True
                 except Exception as exc:
-                    output = f"ERROR: {exc}"
+                    output = (
+                        f"ERROR calling {name}: {exc}. "
+                        f"Expected params: {_expected_params(entry)}"
+                    )
                     was_error = True
 
             tool_call_records.append(

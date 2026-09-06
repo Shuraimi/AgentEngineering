@@ -14,10 +14,17 @@ same functions) will work too.
 
 import argparse
 import os
+import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Windows consoles default to cp1252, which cannot encode characters the
+# LLM's memory statements can contain (confirmed live: U+2011 crashed every
+# print of a learned memory). Route console output through UTF-8 instead.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 import state_store
 
@@ -51,13 +58,16 @@ def main():
             "Set GITHUB_TOKEN in .env for a smoother run.\n"
         )
 
-    def on_step(result, state):
+    def on_step(result, state, change):
         print(f"\n=== Step {result.step} ===")
+
+        tool_calls = sum(len(c.tool_calls) for c in result.cases)
 
         print(
             f"Accuracy: {result.accuracy:.0%} | "
             f"Avg cost: ${result.avg_cost_usd:.4f} | "
             f"Avg latency: {result.avg_latency_s:.2f}s | "
+            f"Tool calls: {tool_calls} | "
             f"Tool errors: {result.tool_error_count}"
         )
 
@@ -66,11 +76,30 @@ def main():
             f"-> {len(state.memory)}"
         )
 
-        if len(state.memory) > result.memory_size_before:
-            print("New memory entries this step:")
-
-            for m in state.memory[result.memory_size_before:]:
-                print(f"  [{m.kind}] {m.statement}")
+        if change.created:
+            print(f"Memories created ({len(change.created)}):")
+            by_id = {m.id: m for m in state.memory}
+            for mid in change.created:
+                m = by_id.get(mid)
+                if m:
+                    print(f"  [{m.kind}] {m.statement}")
+        if change.merged:
+            print(f"Memories merged (duplicates reinforced, {len(change.merged)}):")
+            for stmt in change.merged:
+                print(f"  ~ {stmt}")
+        if change.revised:
+            print(f"Memories revised ({len(change.revised)}):")
+            by_id = {m.id: m for m in state.memory}
+            for mid in change.revised:
+                m = by_id.get(mid)
+                if m:
+                    print(f"  [revised {mid}] {m.statement}")
+        if change.rejected:
+            print(f"Memories rejected ({len(change.rejected)}):")
+            for stmt, reason in change.rejected:
+                print(f"  x {stmt}  ({reason})")
+        if change.dropped_revisions:
+            print(f"Revisions dropped (unknown ids): {change.dropped_revisions}")
 
     final_state, history = run_learning_session(
         args.owner,

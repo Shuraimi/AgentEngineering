@@ -13,7 +13,7 @@ from typing import Callable, Optional
 import github_tools
 import state_store
 from evaluator import score_case
-from models import AgentState, BatchResult, CaseResult, IssueCase
+from models import AgentState, BatchResult, CaseResult, IssueCase, MemoryChange
 from reflector import apply_reflection, build_initial_state, reflect
 from runner import run_worker_agent
 
@@ -81,13 +81,13 @@ def run_time_step(
 def run_learning_session(
     owner: str, repo: str, token: Optional[str], num_batches: int = 4, batch_size: int = 6,
     resume: bool = True,
-    on_step: Optional[Callable[[BatchResult, AgentState], None]] = None,
+    on_step: Optional[Callable[[BatchResult, AgentState, MemoryChange], None]] = None,
 ) -> tuple[AgentState, list[BatchResult]]:
     """
     Runs (or resumes) a full learning session: num_batches sequential time
-    steps over real historical issues. on_step(batch_result, state_after)
-    is called after each step - this is what app.py hooks into for the live
-    UI, same pattern as before.
+    steps over real historical issues. on_step(batch_result, state_after,
+    memory_change) is called after each step - this is what app.py hooks into
+    for the live UI, same pattern as before.
     """
     labels, cases = prepare_dataset(owner, repo, token, num_batches, batch_size)
 
@@ -104,13 +104,13 @@ def run_learning_session(
             continue
         result = run_time_step(state, batch, owner, repo, token, labels)
         reflection = reflect(state, result)
-        state = apply_reflection(state, reflection)
+        state, change = apply_reflection(state, reflection)
 
         state_store.save_state(state)
         state_store.save_batch_result(owner, repo, result)
         history.append(result)
 
         if on_step:
-            on_step(result, state)
+            on_step(result, state, change)
 
     return state, history

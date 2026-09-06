@@ -71,6 +71,35 @@ def _extract_json(text: str) -> Any:
     return json.loads(text[start:end + 1])
 
 
+def clean_model_message(raw: str | None) -> str:
+    """
+    GPT-OSS can expose its harmony/reasoning channel markers
+    (<|channel|>final, <|message|>) in message.content on some hosted NIM
+    responses. Keep only the final answer portion when those markers are
+    present. Used everywhere we parse model text - call_for_json AND the
+    worker runner - so one helper keeps both parsing paths consistent.
+    """
+    text = raw or ""
+    if "<|channel|>final" in text:
+        text = text.split("<|channel|>final", 1)[1]
+    text = text.replace("<|message|>", "").strip()
+    return text
+
+
+def clean_tool_name(name: str | None) -> str:
+    """
+    GPT-OSS can also append its harmony channel marker to the FUNCTION NAME of
+    a tool call (e.g. `search_similar_issues<|channel|>commentary`).
+    Strip any `<|...|>` channel marker so the call resolves to the real tool
+    (confirmed live: 3 of the first experiment run's tool errors were exactly
+    "unknown tool search_similar_issues<|channel|>commentary").
+    """
+    text = (name or "").strip()
+    if "<|" in text:
+        text = text.split("<|", 1)[0].strip()
+    return text
+
+
 def call_for_json(prompt: str, max_tokens: int = 4096) -> dict:
     """
     Call the configured OpenAI-compatible model and return a parsed JSON dict.
@@ -93,14 +122,7 @@ def call_for_json(prompt: str, max_tokens: int = 4096) -> dict:
             max_tokens=max_tokens,
         )
         message = response.choices[0].message
-        raw = message.content or ""
-
-        # GPT-OSS can expose its harmony/reasoning channel markers in
-        # message.content on some hosted NIM responses. Keep only the final
-        # answer portion when those markers are present.
-        if "<|channel|>final" in raw:
-            raw = raw.split("<|channel|>final", 1)[1]
-        raw = raw.replace("<|message|>", "").strip()
+        raw = clean_model_message(message.content)
 
         parsed = _extract_json(raw)
         if not isinstance(parsed, dict):
